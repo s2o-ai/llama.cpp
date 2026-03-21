@@ -26,8 +26,8 @@
 #include <cstring>
 #include <cstdio>
 
-// Only compile when we have at least AVX2
-#if defined(__AVX2__)
+// Compile when we have AVX2 (x86) or NEON (ARM)
+#if defined(__AVX2__) || defined(__ARM_NEON)
 
 // ============================================================================
 // Context: selected kernel set
@@ -289,4 +289,4 @@ ggml_backend_buffer_type_t ggml_backend_cpu_s2o_lut_buffer_type(void) {
     return &ggml_backend_buffer_type_s2o_lut;
 }
 
-#endif // defined(__AVX2__)
+#endif // defined(__AVX2__) || defined(__ARM_NEON)

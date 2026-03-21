@@ -567,6 +567,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/s2o-lut/lut-common.h
             ggml-cpu/s2o-lut/lut-x86-avx2.cpp
             ggml-cpu/s2o-lut/lut-x86-avx512.cpp)
+    elseif (GGML_S2O_LUT AND GGML_SYSTEM_ARCH STREQUAL "arm")
+        message(STATUS "S2O LUT: enabling ARM NEON LUT-based INT4 kernels")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_S2O_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/s2o-lut/s2o-lut.cpp
+            ggml-cpu/s2o-lut/s2o-lut.h
+            ggml-cpu/s2o-lut/lut-common.h
+            ggml-cpu/s2o-lut/lut-arm-neon.cpp)
     endif()
 
     if (GGML_CPU_KLEIDIAI)

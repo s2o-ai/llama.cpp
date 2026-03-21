@@ -135,9 +135,22 @@ extern const s2o_lut_kernels s2o_lut_kernels_avx512;
 extern const s2o_lut_kernels s2o_lut_kernels_avx2;
 #endif
 
+#if defined(__ARM_NEON)
+extern const s2o_lut_kernels s2o_lut_kernels_neon;
+extern const s2o_lut_kernels s2o_lut_kernels_neon_dotprod;
+#endif
+
 // Select best available kernel set for current compilation target
 inline const s2o_lut_kernels * s2o_lut_select_kernels(void) {
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__ARM_NEON)
+    // On ARM, DOTPROD variant is always defined (stubs to baseline if not compiled with DOTPROD).
+    // Runtime HWCAP check would go here for dynamic selection — for now, use compile-time.
+#if defined(__ARM_FEATURE_DOTPROD)
+    return &s2o_lut_kernels_neon_dotprod;
+#else
+    return &s2o_lut_kernels_neon;
+#endif
+#elif defined(__AVX512F__) && defined(__AVX512BW__)
     return &s2o_lut_kernels_avx512;
 #elif defined(__AVX2__)
     return &s2o_lut_kernels_avx2;

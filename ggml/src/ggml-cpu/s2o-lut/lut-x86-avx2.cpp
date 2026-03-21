@@ -2,44 +2,124 @@
 // Copyright 2025-2026 S2O AI. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Strategy for Q4_0 dot product using AVX2:
+// High-performance Q4_0 × FP32 dot product for AVX2.
 //
-// Q4_0 stores 32 INT4 weights per block as 16 bytes (nibble pairs) + fp16 scale.
-// Dequantized value: w = d * (q - 8), so:
+// Strategy:
+//   1. Quantize FP32 activations to INT8 on the fly (per Q4_0 block of 32)
+//   2. Unpack Q4_0 nibbles to 32 bytes using bytes_from_nibbles_32 pattern
+//   3. Subtract bias of 8 to center weights in [-8..+7]
+//   4. Use VPMADDUBSW + VPMADDWD for integer dot product → INT32
+//   5. Convert to FP32, scale by (d_weight * d_activation), accumulate
 //
-//   dot = d * [ sum_i(q_i * x_i) - 8 * sum_i(x_i) ]
-//
-// We convert activations to INT8, then use VPMADDUBSW (unsigned q * signed x_int8)
-// to compute q_i * x_i in INT16, followed by VPMADDWD to accumulate to INT32.
-//
-// Alternatively, we use the split-accumulate approach:
-//   1. Load 16 bytes of nibble pairs
-//   2. Unpack to 32 bytes of INT8 (values 0-15)
-//   3. Subtract 8 to center → signed INT8 (-8..+7)
-//   4. Multiply with quantized activations via VPMADDUBSW/VPMADDWD
-//
-// For simplicity and correctness, we use FP32 SIMD for the activation side:
-//   - For each pair of elements, load the nibble, dequant to float, multiply, accumulate.
-//   - This uses _mm256_fmadd_ps for fused multiply-add.
+// This matches ggml's own Q4_0 × Q8_0 fast path, except we quantize
+// the activation on the fly instead of requiring pre-quantized input.
 
 #if defined(__AVX2__)
 
 #include "lut-common.h"
 #include <immintrin.h>
+#include <cmath>
+#include <algorithm>
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
 
 // ============================================================================
-// Q4_0 GEMV — AVX2 (fully vectorized)
+// AVX2 helpers (same patterns as ggml arch/x86/quants.c)
 // ============================================================================
-//
-// Process 8 floats at a time using AVX2 FMA.
-// For each Q4_0 block of 32 elements:
-//   - Extract 32 nibbles into four groups of 8 INT32 values
-//   - Subtract 8, convert to FP32
-//   - FMA with activation vector
-//   - Scale by d and accumulate
+
+// Unpack 16 nibble-pair bytes into 32 bytes in [0..15]
+static inline __m256i s2o_bytes_from_nibbles_32(const uint8_t * qs) {
+    const __m128i tmp = _mm_loadu_si128((const __m128i *)qs);
+    // low 128: original bytes (low nibbles after mask)
+    // high 128: bytes >> 4 (high nibbles after mask)
+    const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
+    return _mm256_and_si256(_mm256_set1_epi8(0x0F), bytes);
+}
+
+// INT8 × INT8 multiply, pairwise add to INT16, then pairwise add to INT32, convert to FP32
+// Uses VPMADDUBSW (unsigned × signed → INT16) + VPMADDWD (INT16 → INT32)
+static inline __m256 s2o_mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
+    // Get absolute values of x vectors
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    // Sign the values of y to compensate
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    // VPMADDUBSW: unsigned(ax) × signed(sy) → 16 INT16 values
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    // VPMADDWD: pairwise add INT16 → 8 INT32, then convert to FP32
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i summed = _mm256_madd_epi16(ones, dot);
+    return _mm256_cvtepi32_ps(summed);
+}
+
+// Horizontal sum of 8 floats
+static inline float s2o_hsum_float_8(const __m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+// ============================================================================
+// On-the-fly FP32 → INT8 quantization for a block of 32 activations
+// ============================================================================
+// Returns the inverse scale (1/d) used, and writes 32 INT8 values to dst.
+// This mimics ggml's Q8_0 quantization but just for a single block.
+
+static inline float s2o_quantize_block_f32_to_i8(const float * src, int8_t * dst) {
+    // Find abs max across 32 floats using AVX2
+    __m256 v0 = _mm256_loadu_ps(src);
+    __m256 v1 = _mm256_loadu_ps(src + 8);
+    __m256 v2 = _mm256_loadu_ps(src + 16);
+    __m256 v3 = _mm256_loadu_ps(src + 24);
+
+    // Absolute values
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    __m256 a0 = _mm256_andnot_ps(sign_mask, v0);
+    __m256 a1 = _mm256_andnot_ps(sign_mask, v1);
+    __m256 a2 = _mm256_andnot_ps(sign_mask, v2);
+    __m256 a3 = _mm256_andnot_ps(sign_mask, v3);
+
+    // Max across all 32
+    __m256 mx = _mm256_max_ps(_mm256_max_ps(a0, a1), _mm256_max_ps(a2, a3));
+    // Horizontal max of 8 floats
+    __m128 hi = _mm256_extractf128_ps(mx, 1);
+    __m128 lo = _mm256_castps256_ps128(mx);
+    __m128 m128 = _mm_max_ps(lo, hi);
+    m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+    m128 = _mm_max_ss(m128, _mm_movehdup_ps(m128));
+    float amax = _mm_cvtss_f32(m128);
+
+    // Scale: map [-amax, amax] to [-127, 127]
+    float d = amax / 127.0f;
+    float id = (d != 0.0f) ? 127.0f / amax : 0.0f;
+
+    // Quantize: round(x * id), clamp to [-128, 127]
+    __m256 vid = _mm256_set1_ps(id);
+    __m256i q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vid));
+    __m256i q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vid));
+    __m256i q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vid));
+    __m256i q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vid));
+
+    // Pack INT32 → INT16 → INT8
+    __m256i q01 = _mm256_packs_epi32(q0, q1);  // 16 INT16
+    __m256i q23 = _mm256_packs_epi32(q2, q3);  // 16 INT16
+    __m256i q_i8 = _mm256_packs_epi16(q01, q23); // 32 INT8
+
+    // AVX2 packs operates within 128-bit lanes, so we need to permute
+    // to get the correct byte order: [0,1,4,5,2,3,6,7] → [0,1,2,3,4,5,6,7]
+    q_i8 = _mm256_permutevar8x32_epi32(q_i8,
+        _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+
+    _mm256_storeu_si256((__m256i *)dst, q_i8);
+
+    return d;
+}
+
+// ============================================================================
+// Q4_0 GEMV — AVX2 (high-performance integer dot product path)
+// ============================================================================
 
 static void s2o_lut_gemv_q4_0_avx2(
     float       * dst,
@@ -51,127 +131,44 @@ static void s2o_lut_gemv_q4_0_avx2(
     size_t        nb
 ) {
     const int64_t nb_k = K / QK4_0;
-    const __m256i lo_mask = _mm256_set1_epi8(0x0F);
-    const __m256i bias_8  = _mm256_set1_epi8(8);
-    const __m256i ones_16 = _mm256_set1_epi16(1);
+    const __m256i off = _mm256_set1_epi8(8);
+
+    // Pre-quantize all activation blocks to INT8
+    // This is done once and reused across all output columns
+    int8_t * act_q8 = (int8_t *)alloca(K * sizeof(int8_t));
+    float  * act_d  = (float *)alloca(nb_k * sizeof(float));
+
+    for (int64_t b = 0; b < nb_k; b++) {
+        act_d[b] = s2o_quantize_block_f32_to_i8(src_act + b * QK4_0, act_q8 + b * QK4_0);
+    }
 
     for (int64_t j = j_start; j < j_end; j++) {
         const block_q4_0 * wt_row = (const block_q4_0 *)((const char *)src_wt + j * nb);
 
-        // Accumulate dot product across all blocks for this output column
-        __m256 sum_f32 = _mm256_setzero_ps();
+        __m256 acc = _mm256_setzero_ps();
 
         for (int64_t b = 0; b < nb_k; b++) {
-            const block_q4_0 * blk = &wt_row[b];
-            const float d = GGML_FP16_TO_FP32(blk->d);
-            const float * x = src_act + b * QK4_0;
+            // Combined scale = weight_d * activation_d
+            const float combined_d = GGML_FP16_TO_FP32(wt_row[b].d) * act_d[b];
+            const __m256 vd = _mm256_set1_ps(combined_d);
 
-            // ---- Integer dot product approach ----
-            // Load 16 bytes of packed nibbles into low 128 bits
-            __m128i qbytes128 = _mm_loadu_si128((const __m128i *)blk->qs);
+            // Unpack Q4_0 nibbles to 32 bytes in [0..15]
+            __m256i qw = s2o_bytes_from_nibbles_32(wt_row[b].qs);
 
-            // Expand to 256 bits: [qbytes | qbytes]
-            // Low 128 bits: original bytes (we extract low nibbles)
-            // High 128 bits: same bytes shifted right (we extract high nibbles)
-            __m256i qbytes = _mm256_set_m128i(qbytes128, qbytes128);
+            // Subtract 8 to center in [-8..+7]
+            qw = _mm256_sub_epi8(qw, off);
 
-            // Extract low and high nibbles
-            __m256i q_lo = _mm256_and_si256(qbytes, lo_mask);                                // low nibbles [0..15] in low 128
-            __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qbytes, 4), lo_mask);          // high nibbles in high 128
+            // Load pre-quantized INT8 activations
+            __m256i qa = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
 
-            // Interleave: want sequential q[0],q[1],q[2],... from [lo_0,lo_1,...,lo_15 | hi_0,hi_1,...,hi_15]
-            // lo has: q[0], q[2], q[4], ..., q[30] in bytes 0-15 (repeated in 16-31)
-            // hi has: q[1], q[3], q[5], ..., q[31] in bytes 16-31
-            // Use unpacklo/unpackhi to interleave them
-            __m256i q_interleaved_lo = _mm256_unpacklo_epi8(q_lo, q_hi); // q[0],q[1],q[2],q[3],...
-            __m256i q_interleaved_hi = _mm256_unpackhi_epi8(q_lo, q_hi);
+            // Integer dot product: 32 INT8 × INT8 → 8 FP32
+            const __m256 q = s2o_mul_sum_i8_pairs_float(qw, qa);
 
-            // Now q_interleaved_lo has elements 0-15 (in 128-bit lanes, interleaved),
-            // q_interleaved_hi has elements 16-31
-            // Due to AVX2 lane semantics, we need to be more careful.
-            // Let's use the simpler FP32 approach that's still vectorized:
-
-            // Load 32 activations as 4 groups of 8 FP32
-            __m256 vx0 = _mm256_loadu_ps(x);       // x[0..7]
-            __m256 vx1 = _mm256_loadu_ps(x + 8);   // x[8..15]
-            __m256 vx2 = _mm256_loadu_ps(x + 16);  // x[16..23]
-            __m256 vx3 = _mm256_loadu_ps(x + 24);  // x[24..31]
-
-            // Extract nibbles to INT32 and convert to FP32, 8 at a time
-            // Group 0: elements 0-7 (bytes 0-3, low and high nibbles interleaved)
-            const uint8_t * qs = blk->qs;
-
-            // Build 8 dequantized weights for elements 0-7
-            __m256 vw0 = _mm256_set_ps(
-                (float)((int)(qs[3] >> 4) - 8),   // q[7]
-                (float)((int)(qs[3] & 0xF) - 8),  // q[6]
-                (float)((int)(qs[2] >> 4) - 8),   // q[5]
-                (float)((int)(qs[2] & 0xF) - 8),  // q[4]
-                (float)((int)(qs[1] >> 4) - 8),   // q[3]
-                (float)((int)(qs[1] & 0xF) - 8),  // q[2]
-                (float)((int)(qs[0] >> 4) - 8),   // q[1]
-                (float)((int)(qs[0] & 0xF) - 8)   // q[0]
-            );
-
-            // Group 1: elements 8-15 (bytes 4-7)
-            __m256 vw1 = _mm256_set_ps(
-                (float)((int)(qs[7] >> 4) - 8),
-                (float)((int)(qs[7] & 0xF) - 8),
-                (float)((int)(qs[6] >> 4) - 8),
-                (float)((int)(qs[6] & 0xF) - 8),
-                (float)((int)(qs[5] >> 4) - 8),
-                (float)((int)(qs[5] & 0xF) - 8),
-                (float)((int)(qs[4] >> 4) - 8),
-                (float)((int)(qs[4] & 0xF) - 8)
-            );
-
-            // Group 2: elements 16-23 (bytes 8-11)
-            __m256 vw2 = _mm256_set_ps(
-                (float)((int)(qs[11] >> 4) - 8),
-                (float)((int)(qs[11] & 0xF) - 8),
-                (float)((int)(qs[10] >> 4) - 8),
-                (float)((int)(qs[10] & 0xF) - 8),
-                (float)((int)(qs[9] >> 4) - 8),
-                (float)((int)(qs[9] & 0xF) - 8),
-                (float)((int)(qs[8] >> 4) - 8),
-                (float)((int)(qs[8] & 0xF) - 8)
-            );
-
-            // Group 3: elements 24-31 (bytes 12-15)
-            __m256 vw3 = _mm256_set_ps(
-                (float)((int)(qs[15] >> 4) - 8),
-                (float)((int)(qs[15] & 0xF) - 8),
-                (float)((int)(qs[14] >> 4) - 8),
-                (float)((int)(qs[14] & 0xF) - 8),
-                (float)((int)(qs[13] >> 4) - 8),
-                (float)((int)(qs[13] & 0xF) - 8),
-                (float)((int)(qs[12] >> 4) - 8),
-                (float)((int)(qs[12] & 0xF) - 8)
-            );
-
-            // FMA: accumulate w * x for all 32 elements
-            __m256 dot = _mm256_mul_ps(vw0, vx0);
-            dot = _mm256_fmadd_ps(vw1, vx1, dot);
-            dot = _mm256_fmadd_ps(vw2, vx2, dot);
-            dot = _mm256_fmadd_ps(vw3, vx3, dot);
-
-            // Horizontal sum of dot (8 floats → 1 float)
-            // hadd pairs: [a0+a1, a2+a3, b0+b1, b2+b3, a4+a5, a6+a7, b4+b5, b6+b7]
-            __m128 hi128 = _mm256_extractf128_ps(dot, 1);
-            __m128 lo128 = _mm256_castps256_ps128(dot);
-            __m128 sum128 = _mm_add_ps(lo128, hi128);           // 4 floats
-            __m128 shuf = _mm_movehdup_ps(sum128);               // [1,1,3,3]
-            __m128 sums = _mm_add_ps(sum128, shuf);              // [0+1, -, 2+3, -]
-            shuf = _mm_movehl_ps(shuf, sums);                    // [2+3, -, -, -]
-            sums = _mm_add_ss(sums, shuf);                       // [0+1+2+3]
-
-            float block_dot = _mm_cvtss_f32(sums) * d;
-
-            // Accumulate across blocks
-            sum_f32 = _mm256_add_ps(sum_f32, _mm256_set1_ps(block_dot));
+            // Scale and accumulate
+            acc = _mm256_fmadd_ps(vd, q, acc);
         }
 
-        dst[j] = _mm256_cvtss_f32(sum_f32);
+        dst[j] = s2o_hsum_float_8(acc);
     }
 }
 
