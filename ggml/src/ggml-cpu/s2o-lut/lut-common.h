@@ -68,6 +68,78 @@ static const int8_t s2o_q4_dequant_table[16] __attribute__((aligned(16))) = {
 };
 
 // ============================================================================
+// Global LUT Cache: Pre-built activation LUTs for all scale values
+// ============================================================================
+//
+// Instead of building a 16-entry LUT for each activation group (expensive),
+// we pre-build ONE LUT per unique activation value and reuse across all layers/blocks.
+//
+// For a given activation x and scale d, the LUT entry is:
+//     LUT[q] = d * (q - 8) * x  for q in [0,15]
+//
+// Since we process activations in batches (e.g., 32 elements at once with SIMD),
+// we can accumulate partial sums into a shared LUT and multiply out the scale later.
+//
+// This trades memory (one 16-float LUT per activation value) for speed
+// (no per-block LUT construction during inference).
+
+#include <unordered_map>
+#include <mutex>
+
+struct S2OLutCache {
+    // Maps FP32 bits → pre-built 16-entry LUT for that activation value
+    std::unordered_map<uint32_t, const float*> lut_map;
+    std::mutex lock;
+    std::vector<float> lut_storage;  // backing store for all LUTs
+
+    static S2OLutCache& instance() {
+        static S2OLutCache cache;
+        return cache;
+    }
+
+    // Build LUT for a single activation value x: LUT[q] = (q - 8) * x
+    // Stores in cache and returns pointer
+    const float* get_or_build_lut(float x) {
+        // Convert float to uint32 bits for hashing
+        uint32_t bits;
+        memcpy(&bits, &x, sizeof(float));
+
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            auto it = lut_map.find(bits);
+            if (it != lut_map.end()) {
+                return it->second;
+            }
+        }
+
+        // Not in cache, build it
+        float* lut = new float[16];
+        for (int q = 0; q < 16; q++) {
+            lut[q] = (float)(q - 8) * x;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            lut_map[bits] = lut;
+            return lut;
+        }
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> guard(lock);
+        for (auto& kv : lut_map) {
+            delete[] kv.second;
+        }
+        lut_map.clear();
+        lut_storage.clear();
+    }
+
+    ~S2OLutCache() {
+        clear();
+    }
+};
+
+// ============================================================================
 // Quantized types supported by S2O LUT kernels
 // ============================================================================
 
