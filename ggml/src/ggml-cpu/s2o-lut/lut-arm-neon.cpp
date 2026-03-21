@@ -236,7 +236,9 @@ static void s2o_lut_gemm_q4_0_neon(
 const s2o_lut_kernels s2o_lut_kernels_neon = {
     /* .name      = */ "neon",
     /* .gemv_q4_0 = */ s2o_lut_gemv_q4_0_neon,
-    /* .gemm_q4_0 = */ s2o_lut_gemm_q4_0_neon,
+    /* .gemm_q4_0         = */ s2o_lut_gemm_q4_0_neon,
+    /* .gemv_q4_0_packed  = */ nullptr,
+    /* .gemm_q4_0_packed  = */ nullptr,
 };
 
 // ============================================================================
@@ -321,9 +323,11 @@ static void s2o_lut_gemm_q4_0_neon_dotprod(
 }
 
 const s2o_lut_kernels s2o_lut_kernels_neon_dotprod = {
-    /* .name      = */ "neon_dotprod",
-    /* .gemv_q4_0 = */ s2o_lut_gemv_q4_0_neon_dotprod,
-    /* .gemm_q4_0 = */ s2o_lut_gemm_q4_0_neon_dotprod,
+    /* .name              = */ "neon_dotprod",
+    /* .gemv_q4_0         = */ s2o_lut_gemv_q4_0_neon_dotprod,
+    /* .gemm_q4_0         = */ s2o_lut_gemm_q4_0_neon_dotprod,
+    /* .gemv_q4_0_packed  = */ nullptr,
+    /* .gemm_q4_0_packed  = */ nullptr,
 };
 
 #else
@@ -332,7 +336,9 @@ const s2o_lut_kernels s2o_lut_kernels_neon_dotprod = {
 const s2o_lut_kernels s2o_lut_kernels_neon_dotprod = {
     /* .name      = */ "neon_dotprod",
     /* .gemv_q4_0 = */ s2o_lut_gemv_q4_0_neon,
-    /* .gemm_q4_0 = */ s2o_lut_gemm_q4_0_neon,
+    /* .gemm_q4_0         = */ s2o_lut_gemm_q4_0_neon,
+    /* .gemv_q4_0_packed  = */ nullptr,
+    /* .gemm_q4_0_packed  = */ nullptr,
 };
 
 #endif // __ARM_FEATURE_DOTPROD

@@ -55,6 +55,18 @@
 // Alignment for repacked weight buffers
 #define S2O_LUT_ALIGN 64
 
+// Number of output columns processed per GEMV iteration (multi-column)
+#define S2O_LUT_COLS_PER_ITER 4
+
+// Software prefetch distance (in Q4_0 blocks ahead)
+#define S2O_LUT_PREFETCH_DIST 4
+
+// Q4_0 VPSHUFB dequantization table: maps nibble [0..15] → signed value [-8..+7]
+// Used by VPSHUFB to replace arithmetic nibble-unpack + subtract in one lookup.
+static const int8_t s2o_q4_dequant_table[16] __attribute__((aligned(16))) = {
+    -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7
+};
+
 // ============================================================================
 // Quantized types supported by S2O LUT kernels
 // ============================================================================
@@ -122,9 +134,84 @@ typedef void (*s2o_lut_gemm_fn)(
 
 struct s2o_lut_kernels {
     const char     * name;       // e.g. "avx512", "avx2"
-    s2o_lut_gemv_fn  gemv_q4_0;  // single-row Q4_0
-    s2o_lut_gemm_fn  gemm_q4_0;  // batched Q4_0
+    s2o_lut_gemv_fn  gemv_q4_0;  // single-row Q4_0 (standard layout)
+    s2o_lut_gemm_fn  gemm_q4_0;  // batched Q4_0 (standard layout)
+    s2o_lut_gemv_fn  gemv_q4_0_packed;  // single-row Q4_0 (column-interleaved)
+    s2o_lut_gemm_fn  gemm_q4_0_packed;  // batched Q4_0 (column-interleaved)
 };
+
+// ============================================================================
+// Column-interleaved weight repacking (4-wide groups)
+// ============================================================================
+//
+// Standard Q4_0 layout (row-major):
+//   row0[b0 b1 ... bK] row1[b0 b1 ... bK] ...
+//
+// Packed layout (column-interleaved in groups of 4):
+//   For each group g of 4 columns, for each K-block b:
+//     [col_4g+0 block_b] [col_4g+1 block_b] [col_4g+2 block_b] [col_4g+3 block_b]
+//
+// This places the 4 weight blocks needed by one 4-wide GEMV iteration into
+// contiguous memory (72 bytes = 2 cache lines), reducing cache misses from 4 to ~2.
+//
+// Requires: N % 4 == 0, K % QK4_0 == 0.
+
+#define S2O_LUT_PACKED_MAGIC 0x53325130  // 'S2Q0'
+
+// Q4_0 block size: 2 bytes fp16 scale + QK4_0/2 bytes nibble data = 18 bytes.
+// Defined here to avoid depending on ggml-common.h in this header.
+#define S2O_Q4_0_BLOCK_SIZE (2 + QK4_0 / 2)
+
+// Repack standard Q4_0 → column-interleaved layout.
+// dst and src must not overlap. Both must be at least N * (K/QK4_0) * S2O_Q4_0_BLOCK_SIZE bytes.
+inline void s2o_repack_q4_0(
+    void       * dst,
+    const void * src,
+    int64_t      N,
+    int64_t      K
+) {
+    const int64_t nb_k = K / QK4_0;
+    const int64_t n_groups = N / 4;
+    const size_t bs = S2O_Q4_0_BLOCK_SIZE;
+
+    const char * s = (const char *)src;
+    char       * d = (char *)dst;
+
+    for (int64_t g = 0; g < n_groups; g++) {
+        for (int64_t b = 0; b < nb_k; b++) {
+            for (int c = 0; c < 4; c++) {
+                memcpy(d + (g * nb_k * 4 + b * 4 + c) * bs,
+                       s + ((g * 4 + c) * nb_k + b) * bs,
+                       bs);
+            }
+        }
+    }
+}
+
+// Unpack column-interleaved → standard Q4_0 layout (inverse of repack).
+inline void s2o_unpack_q4_0(
+    void       * dst,
+    const void * src,
+    int64_t      N,
+    int64_t      K
+) {
+    const int64_t nb_k = K / QK4_0;
+    const int64_t n_groups = N / 4;
+    const size_t bs = S2O_Q4_0_BLOCK_SIZE;
+
+    const char * s = (const char *)src;
+    char       * d = (char *)dst;
+
+    for (int64_t g = 0; g < n_groups; g++) {
+        for (int64_t b = 0; b < nb_k; b++) {
+            for (int c = 0; c < 4; c++) {
+                memcpy(d + ((g * 4 + c) * nb_k + b) * bs,
+                       s + (g * nb_k * 4 + b * 4 + c) * bs,
+                       bs);
+            }
+        }
+    }
+}
 
 // Implemented in architecture-specific files:
 #if defined(__AVX512F__) && defined(__AVX512BW__)

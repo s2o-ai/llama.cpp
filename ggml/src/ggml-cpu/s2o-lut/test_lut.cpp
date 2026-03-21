@@ -225,6 +225,130 @@ static int run_gemm_test(const char * kernel_name, const s2o_lut_kernels * kerne
     return 0;
 }
 
+// ============================================================================
+// Repack roundtrip test: pack → unpack → compare
+// ============================================================================
+
+static int run_repack_roundtrip_test(int K, int N, unsigned seed) {
+    printf("  Testing repack roundtrip: K=%d, N=%d, seed=%u\n", K, N, seed);
+
+    std::mt19937 rng(seed);
+
+    const int64_t blocks_per_row = K / QK4_0;
+    std::vector<block_q4_0> original(blocks_per_row * N);
+
+    // Fill with random block data
+    for (auto & blk : original) {
+        blk.d = GGML_FP32_TO_FP16(0.1f * (float)(rng() % 100) / 100.0f);
+        for (int i = 0; i < 16; i++) {
+            blk.qs[i] = (uint8_t)(rng() & 0xFF);
+        }
+    }
+
+    // Pack
+    std::vector<block_q4_0> packed(blocks_per_row * N);
+    s2o_repack_q4_0(packed.data(), original.data(), N, K);
+
+    // Unpack
+    std::vector<block_q4_0> unpacked(blocks_per_row * N);
+    s2o_unpack_q4_0(unpacked.data(), packed.data(), N, K);
+
+    // Compare element-by-element
+    int errors = 0;
+    for (int64_t i = 0; i < blocks_per_row * N; i++) {
+        if (original[i].d != unpacked[i].d ||
+            memcmp(original[i].qs, unpacked[i].qs, 16) != 0) {
+            if (errors < 3) {
+                printf("    MISMATCH at block %d\n", (int)i);
+            }
+            errors++;
+        }
+    }
+
+    if (errors > 0) {
+        printf("  [FAIL] repack roundtrip: %d mismatches\n", errors);
+        return 1;
+    }
+    printf("  [PASS] repack roundtrip\n");
+    return 0;
+}
+
+// ============================================================================
+// Packed GEMV correctness test
+// ============================================================================
+
+static int run_packed_test(const char * kernel_name, const s2o_lut_kernels * kernels,
+                           int K, int N, unsigned seed) {
+    if (!kernels || !kernels->gemv_q4_0_packed) {
+        printf("  [SKIP] %s packed: kernel not available\n", kernel_name);
+        return 0;
+    }
+
+    if (N % 4 != 0) {
+        printf("  [SKIP] %s packed: N=%d not multiple of 4\n", kernel_name, N);
+        return 0;
+    }
+
+    printf("  Testing %s packed GEMV: K=%d, N=%d, seed=%u\n", kernel_name, K, N, seed);
+
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> wt_float(K * N);
+    for (auto & v : wt_float) v = dist(rng);
+
+    const int64_t blocks_per_row = K / QK4_0;
+    std::vector<block_q4_0> wt_q4(blocks_per_row * N);
+    for (int j = 0; j < N; j++) {
+        quantize_row_q4_0(wt_float.data() + j * K, wt_q4.data() + j * blocks_per_row, K);
+    }
+
+    // Repack to column-interleaved layout
+    std::vector<block_q4_0> wt_packed(blocks_per_row * N);
+    s2o_repack_q4_0(wt_packed.data(), wt_q4.data(), N, K);
+
+    std::vector<float> act(K);
+    for (auto & v : act) v = dist(rng);
+
+    // Reference output (standard layout, FP32 activations)
+    std::vector<float> ref_out(N);
+    for (int j = 0; j < N; j++) {
+        ref_out[j] = ref_dot_q4_0(act.data(), wt_q4.data() + j * blocks_per_row, K);
+    }
+
+    // Packed kernel output
+    std::vector<float> lut_out(N, 0.0f);
+    kernels->gemv_q4_0_packed(lut_out.data(), act.data(), wt_packed.data(), K, 0, N, 0);
+
+    float max_abs_err = 0.0f;
+    float max_rel_err = 0.0f;
+    int errors = 0;
+
+    for (int j = 0; j < N; j++) {
+        float abs_err = fabsf(lut_out[j] - ref_out[j]);
+        float rel_err = (fabsf(ref_out[j]) > 1e-6f) ? abs_err / fabsf(ref_out[j]) : abs_err;
+        if (abs_err > max_abs_err) max_abs_err = abs_err;
+        if (rel_err > max_rel_err) max_rel_err = rel_err;
+        if (abs_err > 2.0f && rel_err > 0.10f) {
+            if (errors < 5) {
+                printf("    MISMATCH j=%d: ref=%.6f lut=%.6f abs_err=%.2e rel_err=%.2e\n",
+                       j, ref_out[j], lut_out[j], abs_err, rel_err);
+            }
+            errors++;
+        }
+    }
+
+    printf("    max_abs_err=%.2e  max_rel_err=%.2e  errors=%d/%d\n",
+           max_abs_err, max_rel_err, errors, N);
+
+    if (errors > 0) {
+        printf("  [FAIL] %s packed GEMV\n", kernel_name);
+        return 1;
+    }
+    printf("  [PASS] %s packed GEMV\n", kernel_name);
+    return 0;
+}
+
 int main() {
     printf("S2O LUT Kernel Correctness Tests\n");
     printf("================================\n\n");
@@ -242,6 +366,14 @@ int main() {
         {4096, 512 },   // realistic model dimension
     };
 
+    // Packed configs (N must be multiple of 4)
+    struct { int K; int N; } packed_configs[] = {
+        {  32,  16 },
+        { 256,  64 },
+        {1024, 256 },
+        {4096, 512 },
+    };
+
 #if defined(__AVX2__)
     printf("AVX2 GEMV tests:\n");
     for (const auto & cfg : configs) {
@@ -252,6 +384,15 @@ int main() {
     failures += run_gemm_test("avx2", &s2o_lut_kernels_avx2, 1, 256, 64, 42);
     failures += run_gemm_test("avx2", &s2o_lut_kernels_avx2, 4, 512, 128, 42);
     failures += run_gemm_test("avx2", &s2o_lut_kernels_avx2, 16, 1024, 256, 42);
+
+    printf("\nRepack roundtrip tests:\n");
+    failures += run_repack_roundtrip_test(256, 64, 42);
+    failures += run_repack_roundtrip_test(4096, 512, 99);
+
+    printf("\nAVX2 packed GEMV tests:\n");
+    for (const auto & cfg : packed_configs) {
+        failures += run_packed_test("avx2", &s2o_lut_kernels_avx2, cfg.K, cfg.N, 42);
+    }
 #endif
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -264,6 +405,11 @@ int main() {
     failures += run_gemm_test("avx512", &s2o_lut_kernels_avx512, 1, 256, 64, 42);
     failures += run_gemm_test("avx512", &s2o_lut_kernels_avx512, 4, 512, 128, 42);
     failures += run_gemm_test("avx512", &s2o_lut_kernels_avx512, 16, 1024, 256, 42);
+
+    printf("\nAVX-512 packed GEMV tests:\n");
+    for (const auto & cfg : packed_configs) {
+        failures += run_packed_test("avx512", &s2o_lut_kernels_avx512, cfg.K, cfg.N, 42);
+    }
 #endif
 
     printf("\n================================\n");

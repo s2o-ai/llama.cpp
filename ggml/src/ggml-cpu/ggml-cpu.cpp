@@ -22,6 +22,10 @@
 #    include "spacemit/ime.h"
 #endif
 
+#ifdef GGML_USE_S2O_LUT
+#    include "s2o-lut/s2o-lut.h"
+#endif
+
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -64,6 +68,12 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #ifdef GGML_USE_CPU_REPACK
         if (ggml_backend_cpu_repack_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
+        }
+#endif
+
+#ifdef GGML_USE_S2O_LUT
+        if (ggml_backend_cpu_s2o_lut_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_s2o_lut_buffer_type());
         }
 #endif
 

@@ -25,6 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <random>
+#include <chrono>
+#include <vector>
 
 // Compile when we have AVX2 (x86) or NEON (ARM)
 #if defined(__AVX2__) || defined(__ARM_NEON)
@@ -36,12 +39,68 @@
 static const s2o_lut_kernels * s2o_ctx_kernels = nullptr;
 static bool s2o_initialized = false;
 
+// ============================================================================
+// Auto-benchmark: measure kernel throughput at init
+// ============================================================================
+
+static void s2o_lut_auto_benchmark(const s2o_lut_kernels * kernels) {
+    if (!kernels || !kernels->gemv_q4_0) return;
+
+    // Synthetic: K=2048, N=256 (small enough to finish fast, large enough to measure)
+    const int64_t K = 2048;
+    const int64_t N = 256;
+    const int64_t nb_k = K / QK4_0;
+    const size_t nb_bytes = nb_k * sizeof(block_q4_0);
+
+    std::vector<block_q4_0> weights(nb_k * N);
+    std::vector<float> activations(K);
+    std::vector<float> output(N);
+
+    // Fill with pseudo-random data
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto & v : activations) v = dist(rng);
+
+    for (int64_t j = 0; j < N; j++) {
+        for (int64_t b = 0; b < nb_k; b++) {
+            auto & blk = weights[j * nb_k + b];
+            blk.d = GGML_FP32_TO_FP16(0.1f);
+            for (int i = 0; i < 16; i++) {
+                blk.qs[i] = (uint8_t)(rng() & 0xFF);
+            }
+        }
+    }
+
+    // Warmup
+    for (int w = 0; w < 3; w++) {
+        kernels->gemv_q4_0(output.data(), activations.data(), weights.data(),
+                           K, 0, N, nb_bytes);
+    }
+
+    // Timed runs
+    const int runs = 10;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < runs; r++) {
+        kernels->gemv_q4_0(output.data(), activations.data(), weights.data(),
+                           K, 0, N, nb_bytes);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double ops_per_run = (double)K * N * 2.0;  // multiply + add per element
+    double gops = (ops_per_run * runs) / (elapsed_ms * 1e6);
+
+    fprintf(stderr, "s2o-lut: benchmark K=%d N=%d: %.1f GOPS (%.2f ms / %d runs)\n",
+            (int)K, (int)N, gops, elapsed_ms, runs);
+}
+
 static void s2o_lut_init(void) {
     if (s2o_initialized) return;
     s2o_initialized = true;
     s2o_ctx_kernels = s2o_lut_select_kernels();
     if (s2o_ctx_kernels) {
         fprintf(stderr, "s2o-lut: using %s kernels\n", s2o_ctx_kernels->name);
+        s2o_lut_auto_benchmark(s2o_ctx_kernels);
     } else {
         fprintf(stderr, "s2o-lut: no compatible kernels found\n");
     }
@@ -120,8 +179,69 @@ class tensor_traits : public ggml::cpu::tensor_traits {
     }
 };
 
+// Packed layout tensor traits — uses column-interleaved kernel variants
+class packed_tensor_traits : public ggml::cpu::tensor_traits {
+    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+        GGML_UNUSED(op);
+        size = 0;
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+
+        if (!s2o_ctx_kernels || !s2o_ctx_kernels->gemv_q4_0_packed) {
+            return false;
+        }
+
+        const struct ggml_tensor * src0 = op->src[0];
+        const struct ggml_tensor * src1 = op->src[1];
+
+        const int64_t K = src0->ne[0];
+        const int64_t N = src0->ne[1];
+        const int64_t M = src1->ne[1];
+
+        const int64_t n_per_thread = (N + params->nth - 1) / params->nth;
+        const int64_t j_start = params->ith * n_per_thread;
+        const int64_t j_end   = std::min(j_start + n_per_thread, N);
+
+        if (j_start >= j_end) {
+            return true;
+        }
+
+        float       * dst_data = (float *)op->data;
+        const float * act_data = (const float *)src1->data;
+        const void  * wt_data  = src0->data;
+
+        if (M == 1) {
+            s2o_ctx_kernels->gemv_q4_0_packed(
+                dst_data, act_data, wt_data,
+                K, j_start, j_end, 0
+            );
+        } else {
+            const int64_t dst_stride = op->ne[0];
+            const int64_t act_stride = src1->ne[0];
+
+            s2o_ctx_kernels->gemm_q4_0_packed(
+                dst_data, act_data, wt_data,
+                M, K, j_start, j_end, 0,
+                dst_stride, act_stride
+            );
+        }
+
+        return true;
+    }
+};
+
 static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struct ggml_tensor *) {
     static tensor_traits traits;
+    return &traits;
+}
+
+static ggml::cpu::tensor_traits * get_packed_tensor_traits() {
+    static packed_tensor_traits traits;
     return &traits;
 }
 
@@ -160,9 +280,29 @@ static void ggml_backend_s2o_lut_buffer_set_tensor(
     ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
     const void * data, size_t offset, size_t size
 ) {
-    // Currently passthrough — weights are stored in standard Q4_0 layout.
-    // Future: repack into LUT-friendly interleaved nibble layout for
-    //         direct VPSHUFB indexing without per-block split.
+    // Try column-interleaved repacking for Q4_0 tensors when:
+    //   - Full tensor write (offset == 0, size == expected total)
+    //   - N is a multiple of 4 (required for group alignment)
+    //   - Packed kernel variant is available
+    if (offset == 0 && tensor->type == GGML_TYPE_Q4_0 &&
+        s2o_ctx_kernels && s2o_ctx_kernels->gemv_q4_0_packed) {
+
+        const int64_t K = tensor->ne[0];
+        const int64_t N = tensor->ne[1];
+        const int64_t nb_k = K / QK4_0;
+        const size_t expected_size = (size_t)(N * nb_k) * sizeof(block_q4_0);
+
+        if (size == expected_size && N % 4 == 0 && K % QK4_0 == 0) {
+            // Repack: standard row-major → column-interleaved groups of 4
+            s2o_repack_q4_0(tensor->data, data, N, K);
+            // Switch to packed tensor traits for compute_forward dispatch
+            tensor->extra = (void *)ggml::cpu::s2o_lut::get_packed_tensor_traits();
+            GGML_UNUSED(buffer);
+            return;
+        }
+    }
+
+    // Fallback: standard memcpy (incremental writes or non-Q4_0 types)
     memcpy((char *)tensor->data + offset, data, size);
     GGML_UNUSED(buffer);
 }

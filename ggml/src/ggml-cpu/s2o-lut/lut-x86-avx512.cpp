@@ -2,22 +2,14 @@
 // Copyright 2025-2026 S2O AI. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// AVX-512 dual-column processing: processes 2 output columns per iteration
-// using 512-bit integer dot product, doubling throughput vs AVX2.
-//
-// Strategy (same integer dot product as AVX2, but wider):
-//   1. Quantize FP32 activations to INT8 on the fly (16 floats/instr with AVX-512)
-//   2. For each pair of output columns:
-//      a. Unpack Q4_0 nibbles to 32 bytes per column (256-bit)
-//      b. Combine weights from 2 columns into one 512-bit register
-//      c. Duplicate INT8 activations into 512-bit register
-//      d. 512-bit VPMADDUBSW + VPMADDWD integer dot product
-//      e. Split result back into per-column accumulators
-//   3. Scale by (d_weight * d_activation), accumulate
+// AVX-512 4-wide column processing with VPSHUFB dequantization:
+//   - Processes 4 output columns per GEMV iteration (2 pairs of 2, each pair
+//     combined into a 512-bit register for dual-column dot product)
+//   - VPSHUFB replaces nibble-unpack arithmetic with 16-entry LUT
+//   - Software prefetch for weight blocks
+//   - L2 cache-aware tiling for GEMM
 //
 // Uses only AVX512F + AVX512BW intrinsics (no DQ dependency).
-// VPMOVDB for efficient INT32→INT8 packing during quantization.
-// Mask-based sign handling replaces VPSIGNB (which only exists for 128/256-bit).
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 
@@ -25,6 +17,7 @@
 #include <immintrin.h>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -33,34 +26,36 @@
 // 512-bit lane helpers (AVX512F only, no DQ required)
 // ============================================================================
 
-// Combine two __m256i into __m512i: [lo | hi]
-// Uses VSHUFI32X4 (AVX512F) instead of VINSERTI64X4 (AVX512DQ)
 static inline __m512i s2o_set_m256i(const __m256i lo, const __m256i hi) {
     const __m512i lo_512 = _mm512_castsi256_si512(lo);
     const __m512i hi_512 = _mm512_castsi256_si512(hi);
-    // imm 0x44 = 01_00_01_00: lane0=a[0], lane1=a[1], lane2=b[0], lane3=b[1]
     return _mm512_shuffle_i32x4(lo_512, hi_512, 0x44);
 }
 
-// Extract upper 256 bits of __m512 as __m256
-// Uses VSHUFF32X4 (AVX512F) instead of VEXTRACTF32X8 (AVX512DQ)
 static inline __m256 s2o_extract_hi_ps(const __m512 v) {
-    // imm 0x4E = 01_00_11_10: swaps [2,3] to low, [0,1] to high
     return _mm512_castps512_ps256(_mm512_shuffle_f32x4(v, v, 0x4E));
 }
 
 // ============================================================================
-// AVX2 helpers (for per-block 256-bit operations)
+// VPSHUFB dequantization: nibble → signed INT8 via constant LUT
 // ============================================================================
 
-// Unpack 16 nibble-pair bytes into 32 bytes in [0..15]
-static inline __m256i s2o_bytes_from_nibbles_32(const uint8_t * qs) {
-    const __m128i tmp = _mm_loadu_si128((const __m128i *)qs);
-    const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
-    return _mm256_and_si256(_mm256_set1_epi8(0x0F), bytes);
+static inline __m256i s2o_vpshufb_dequant_q4_0(const uint8_t * qs) {
+    const __m128i lut  = _mm_load_si128((const __m128i *)s2o_q4_dequant_table);
+    const __m128i m4b  = _mm_set1_epi8(0x0F);
+    const __m128i raw  = _mm_loadu_si128((const __m128i *)qs);
+
+    const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(raw, m4b));
+    const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(raw, 4), m4b));
+
+    return _mm256_set_m128i(hi, lo);
 }
 
-// INT8 × INT8 → FP32, 256-bit (for trailing odd column)
+// ============================================================================
+// INT8 × INT8 → FP32 dot products (256-bit and 512-bit)
+// ============================================================================
+
+// 256-bit path (for trailing odd column)
 static inline __m256 s2o_mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
@@ -70,20 +65,14 @@ static inline __m256 s2o_mul_sum_i8_pairs_float(const __m256i x, const __m256i y
     return _mm256_cvtepi32_ps(summed);
 }
 
-// INT8 × INT8 → FP32, 512-bit (for dual-column processing)
-// AVX-512 lacks VPSIGNB, so we use mask + conditional negate.
+// 512-bit path (for dual-column processing)
 static inline __m512 s2o_mul_sum_i8_pairs_float_512(const __m512i x, const __m512i y) {
     const __m512i zero = _mm512_setzero_si512();
-    // Mask where x < 0
     const __mmask64 neg = _mm512_cmpgt_epi8_mask(zero, x);
-    // |x| (unsigned operand for VPMADDUBSW)
     const __m512i ax = _mm512_abs_epi8(x);
-    // Conditionally negate y where x was negative
     const __m512i ny = _mm512_sub_epi8(zero, y);
     const __m512i sy = _mm512_mask_blend_epi8(neg, y, ny);
-    // VPMADDUBSW: unsigned(|x|) × signed(sy) → 32 INT16
     const __m512i dot = _mm512_maddubs_epi16(ax, sy);
-    // VPMADDWD: pairwise add INT16 → 16 INT32
     const __m512i ones = _mm512_set1_epi16(1);
     const __m512i summed = _mm512_madd_epi16(ones, dot);
     return _mm512_cvtepi32_ps(summed);
@@ -101,32 +90,24 @@ static inline float s2o_hsum_float_8(const __m256 x) {
 // ============================================================================
 // On-the-fly FP32 → INT8 quantization — AVX-512 accelerated
 // ============================================================================
-// 16 floats per instruction (2x throughput vs AVX2).
-// VPMOVDB for direct INT32→INT8 packing (no lane reorder needed).
 
 static inline float s2o_quantize_block_f32_to_i8(const float * src, int8_t * dst) {
-    // Load 32 floats as 2 × __m512 (16 each)
     __m512 v0 = _mm512_loadu_ps(src);
     __m512 v1 = _mm512_loadu_ps(src + 16);
 
-    // Absolute values via integer AND (avoids AVX512DQ _mm512_andnot_ps)
     const __m512i abs_mask = _mm512_set1_epi32(0x7FFFFFFF);
     __m512 a0 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v0), abs_mask));
     __m512 a1 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v1), abs_mask));
 
-    // Max absolute value across all 32 elements
     float amax = _mm512_reduce_max_ps(_mm512_max_ps(a0, a1));
 
-    // Scale: map [-amax, amax] to [-127, 127]
     float d = amax / 127.0f;
     float id = (d != 0.0f) ? 127.0f / amax : 0.0f;
 
-    // Quantize: round(x * id), clamp to [-128, 127]
     __m512 vid = _mm512_set1_ps(id);
     __m512i q0 = _mm512_cvtps_epi32(_mm512_mul_ps(v0, vid));
     __m512i q1 = _mm512_cvtps_epi32(_mm512_mul_ps(v1, vid));
 
-    // Pack INT32 → INT8 with saturation (VPMOVDB), 16 values per instruction
     _mm_storeu_si128((__m128i *)dst,        _mm512_cvtsepi32_epi8(q0));
     _mm_storeu_si128((__m128i *)(dst + 16), _mm512_cvtsepi32_epi8(q1));
 
@@ -134,8 +115,10 @@ static inline float s2o_quantize_block_f32_to_i8(const float * src, int8_t * dst
 }
 
 // ============================================================================
-// Q4_0 GEMV — AVX-512 (dual-column integer dot product)
+// Q4_0 GEMV — AVX-512, 4-wide column processing
 // ============================================================================
+// Processes 4 columns per iteration as 2 pairs, each pair using 512-bit
+// dual-column dot product. This is 2x the throughput of the previous 2-wide.
 
 static void s2o_lut_gemv_q4_0_avx512(
     float       * dst,
@@ -147,9 +130,8 @@ static void s2o_lut_gemv_q4_0_avx512(
     size_t        nb
 ) {
     const int64_t nb_k = K / QK4_0;
-    const __m256i off = _mm256_set1_epi8(8);
 
-    // Pre-quantize all activation blocks to INT8 (done once, reused across columns)
+    // Pre-quantize all activation blocks to INT8
     int8_t * act_q8 = (int8_t *)alloca(K * sizeof(int8_t));
     float  * act_d  = (float *)alloca(nb_k * sizeof(float));
 
@@ -157,9 +139,78 @@ static void s2o_lut_gemv_q4_0_avx512(
         act_d[b] = s2o_quantize_block_f32_to_i8(src_act + b * QK4_0, act_q8 + b * QK4_0);
     }
 
-    // Process 2 columns at a time using 512-bit integer dot product
+    // ---- 4-wide main loop (2 pairs of dual-column 512-bit) ----
     int64_t j = j_start;
-    for (; j + 1 < j_end; j += 2) {
+    for (; j + 3 < j_end; j += 4) {
+        const block_q4_0 * wr0 = (const block_q4_0 *)((const char *)src_wt + (j + 0) * nb);
+        const block_q4_0 * wr1 = (const block_q4_0 *)((const char *)src_wt + (j + 1) * nb);
+        const block_q4_0 * wr2 = (const block_q4_0 *)((const char *)src_wt + (j + 2) * nb);
+        const block_q4_0 * wr3 = (const block_q4_0 *)((const char *)src_wt + (j + 3) * nb);
+
+        // 4 accumulators (256-bit each, extracted from 512-bit results)
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+
+        for (int64_t b = 0; b < nb_k; b++) {
+            // Prefetch
+            if (b + S2O_LUT_PREFETCH_DIST < nb_k) {
+                _mm_prefetch((const char *)&wr0[b + S2O_LUT_PREFETCH_DIST], _MM_HINT_T0);
+                _mm_prefetch((const char *)&wr1[b + S2O_LUT_PREFETCH_DIST], _MM_HINT_T0);
+                _mm_prefetch((const char *)&wr2[b + S2O_LUT_PREFETCH_DIST], _MM_HINT_T0);
+                _mm_prefetch((const char *)&wr3[b + S2O_LUT_PREFETCH_DIST], _MM_HINT_T0);
+            }
+
+            const float d0 = GGML_FP16_TO_FP32(wr0[b].d) * act_d[b];
+            const float d1 = GGML_FP16_TO_FP32(wr1[b].d) * act_d[b];
+            const float d2 = GGML_FP16_TO_FP32(wr2[b].d) * act_d[b];
+            const float d3 = GGML_FP16_TO_FP32(wr3[b].d) * act_d[b];
+
+            // VPSHUFB dequantize 4 weight blocks → 4 × 256-bit signed INT8
+            const __m256i qw0 = s2o_vpshufb_dequant_q4_0(wr0[b].qs);
+            const __m256i qw1 = s2o_vpshufb_dequant_q4_0(wr1[b].qs);
+            const __m256i qw2 = s2o_vpshufb_dequant_q4_0(wr2[b].qs);
+            const __m256i qw3 = s2o_vpshufb_dequant_q4_0(wr3[b].qs);
+
+            // Activations as 256-bit and 512-bit
+            const __m256i qa256 = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+
+            // Pair 1: columns j+0 and j+1 via 512-bit dual-column
+            {
+                const __m512i qw_pair = s2o_set_m256i(qw0, qw1);
+                const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+                const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
+
+                const __m256 q_lo = _mm512_castps512_ps256(q);
+                const __m256 q_hi = s2o_extract_hi_ps(q);
+
+                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), q_lo, acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), q_hi, acc1);
+            }
+
+            // Pair 2: columns j+2 and j+3 via 512-bit dual-column
+            {
+                const __m512i qw_pair = s2o_set_m256i(qw2, qw3);
+                const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+                const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
+
+                const __m256 q_lo = _mm512_castps512_ps256(q);
+                const __m256 q_hi = s2o_extract_hi_ps(q);
+
+                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), q_lo, acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(d3), q_hi, acc3);
+            }
+        }
+
+        dst[j + 0] = s2o_hsum_float_8(acc0);
+        dst[j + 1] = s2o_hsum_float_8(acc1);
+        dst[j + 2] = s2o_hsum_float_8(acc2);
+        dst[j + 3] = s2o_hsum_float_8(acc3);
+    }
+
+    // ---- 2-wide remainder (512-bit dual-column) ----
+    if (j + 1 < j_end) {
         const block_q4_0 * wr0 = (const block_q4_0 *)((const char *)src_wt + j * nb);
         const block_q4_0 * wr1 = (const block_q4_0 *)((const char *)src_wt + (j + 1) * nb);
 
@@ -170,44 +221,33 @@ static void s2o_lut_gemv_q4_0_avx512(
             const float d0 = GGML_FP16_TO_FP32(wr0[b].d) * act_d[b];
             const float d1 = GGML_FP16_TO_FP32(wr1[b].d) * act_d[b];
 
-            // Unpack Q4_0 nibbles → 32 bytes, subtract 8 to center in [-8..+7]
-            __m256i qw0 = _mm256_sub_epi8(s2o_bytes_from_nibbles_32(wr0[b].qs), off);
-            __m256i qw1 = _mm256_sub_epi8(s2o_bytes_from_nibbles_32(wr1[b].qs), off);
+            const __m256i qw0 = s2o_vpshufb_dequant_q4_0(wr0[b].qs);
+            const __m256i qw1 = s2o_vpshufb_dequant_q4_0(wr1[b].qs);
+            const __m256i qa256 = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
 
-            // Combine into 512-bit: [col_j weights | col_j+1 weights]
-            __m512i qw = s2o_set_m256i(qw0, qw1);
+            const __m512i qw_pair = s2o_set_m256i(qw0, qw1);
+            const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+            const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
 
-            // Duplicate INT8 activations into 512-bit
-            __m256i qa256 = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
-            __m512i qa = s2o_set_m256i(qa256, qa256);
-
-            // 512-bit integer dot product → 16 FP32
-            __m512 q = s2o_mul_sum_i8_pairs_float_512(qw, qa);
-
-            // Lower 8 FP32 → col j partial, upper 8 → col j+1
-            __m256 q_lo = _mm512_castps512_ps256(q);
-            __m256 q_hi = s2o_extract_hi_ps(q);
-
-            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), q_lo, acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), q_hi, acc1);
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm512_castps512_ps256(q), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), s2o_extract_hi_ps(q), acc1);
         }
 
         dst[j]     = s2o_hsum_float_8(acc0);
         dst[j + 1] = s2o_hsum_float_8(acc1);
+        j += 2;
     }
 
-    // Handle trailing odd column with 256-bit path
+    // ---- 1-wide trailing column (256-bit) ----
     if (j < j_end) {
         const block_q4_0 * wr = (const block_q4_0 *)((const char *)src_wt + j * nb);
-
         __m256 acc = _mm256_setzero_ps();
 
         for (int64_t b = 0; b < nb_k; b++) {
             const float combined_d = GGML_FP16_TO_FP32(wr[b].d) * act_d[b];
-            __m256i qw = _mm256_sub_epi8(s2o_bytes_from_nibbles_32(wr[b].qs), off);
-            __m256i qa = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
-            __m256 q = s2o_mul_sum_i8_pairs_float(qw, qa);
-            acc = _mm256_fmadd_ps(_mm256_set1_ps(combined_d), q, acc);
+            const __m256i qw = s2o_vpshufb_dequant_q4_0(wr[b].qs);
+            const __m256i qa = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(combined_d), s2o_mul_sum_i8_pairs_float(qw, qa), acc);
         }
 
         dst[j] = s2o_hsum_float_8(acc);
@@ -215,7 +255,7 @@ static void s2o_lut_gemv_q4_0_avx512(
 }
 
 // ============================================================================
-// Q4_0 GEMM — AVX-512 (batched, for prompt processing)
+// Q4_0 GEMM — AVX-512 (L2 cache-aware tiling)
 // ============================================================================
 
 static void s2o_lut_gemm_q4_0_avx512(
@@ -230,13 +270,240 @@ static void s2o_lut_gemm_q4_0_avx512(
     int64_t       dst_stride,
     int64_t       act_stride
 ) {
-    for (int64_t i = 0; i < M; i++) {
-        s2o_lut_gemv_q4_0_avx512(
-            dst + i * dst_stride,
-            src_act + i * act_stride,
-            src_wt,
-            K, j_start, j_end, nb
-        );
+    const int64_t bytes_per_col = (K / QK4_0) * sizeof(block_q4_0);
+    int64_t tile_n = S2O_LUT_DEFAULT_L2_TILE_BYTES / bytes_per_col;
+    if (tile_n < 4) tile_n = 4;
+    tile_n = (tile_n / 4) * 4;
+
+    const int64_t N = j_end - j_start;
+
+    if (M <= 1 || N <= tile_n) {
+        for (int64_t i = 0; i < M; i++) {
+            s2o_lut_gemv_q4_0_avx512(
+                dst + i * dst_stride,
+                src_act + i * act_stride,
+                src_wt,
+                K, j_start, j_end, nb
+            );
+        }
+        return;
+    }
+
+    for (int64_t j_tile = j_start; j_tile < j_end; j_tile += tile_n) {
+        const int64_t j_tile_end = std::min(j_tile + tile_n, j_end);
+
+        for (int64_t i = 0; i < M; i++) {
+            s2o_lut_gemv_q4_0_avx512(
+                dst + i * dst_stride,
+                src_act + i * act_stride,
+                src_wt,
+                K, j_tile, j_tile_end, nb
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Q4_0 GEMV — AVX-512, packed (column-interleaved) layout
+// ============================================================================
+// Same 4-wide dual-pair algorithm, but weight blocks for each 4-column group
+// are contiguous: group_base[b*4 + c] for block b, column c in [0,3].
+
+static void s2o_lut_gemv_q4_0_packed_avx512(
+    float       * dst,
+    const float * src_act,
+    const void  * src_wt,
+    int64_t       K,
+    int64_t       j_start,
+    int64_t       j_end,
+    size_t        nb
+) {
+    (void)nb;
+    const int64_t nb_k = K / QK4_0;
+    const block_q4_0 * wt = (const block_q4_0 *)src_wt;
+
+    int8_t * act_q8 = (int8_t *)alloca(K * sizeof(int8_t));
+    float  * act_d  = (float *)alloca(nb_k * sizeof(float));
+
+    for (int64_t b = 0; b < nb_k; b++) {
+        act_d[b] = s2o_quantize_block_f32_to_i8(src_act + b * QK4_0, act_q8 + b * QK4_0);
+    }
+
+    int64_t j = j_start;
+
+    // Handle unaligned prefix
+    const int64_t j_aligned = ((j_start + 3) / 4) * 4;
+    for (; j < std::min(j_aligned, j_end); j++) {
+        const int64_t group = j / 4;
+        const int64_t c = j % 4;
+        const block_q4_0 * group_base = wt + group * nb_k * 4;
+
+        __m256 acc = _mm256_setzero_ps();
+        for (int64_t b = 0; b < nb_k; b++) {
+            const block_q4_0 * wr = &group_base[b * 4 + c];
+            const float combined_d = GGML_FP16_TO_FP32(wr->d) * act_d[b];
+            const __m256i qw = s2o_vpshufb_dequant_q4_0(wr->qs);
+            const __m256i qa = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(combined_d), s2o_mul_sum_i8_pairs_float(qw, qa), acc);
+        }
+        dst[j] = s2o_hsum_float_8(acc);
+    }
+
+    // ---- 4-wide packed loop (2 pairs of dual-column 512-bit) ----
+    for (; j + 3 < j_end; j += 4) {
+        const int64_t group = j / 4;
+        const block_q4_0 * group_base = wt + group * nb_k * 4;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+
+        for (int64_t b = 0; b < nb_k; b++) {
+            // Contiguous: 4 blocks at group_base[b*4 + 0..3]
+            const block_q4_0 * wr0 = &group_base[b * 4 + 0];
+            const block_q4_0 * wr1 = &group_base[b * 4 + 1];
+            const block_q4_0 * wr2 = &group_base[b * 4 + 2];
+            const block_q4_0 * wr3 = &group_base[b * 4 + 3];
+
+            if (b + S2O_LUT_PREFETCH_DIST < nb_k) {
+                _mm_prefetch((const char *)&group_base[(b + S2O_LUT_PREFETCH_DIST) * 4], _MM_HINT_T0);
+            }
+
+            const float d0 = GGML_FP16_TO_FP32(wr0->d) * act_d[b];
+            const float d1 = GGML_FP16_TO_FP32(wr1->d) * act_d[b];
+            const float d2 = GGML_FP16_TO_FP32(wr2->d) * act_d[b];
+            const float d3 = GGML_FP16_TO_FP32(wr3->d) * act_d[b];
+
+            const __m256i qw0 = s2o_vpshufb_dequant_q4_0(wr0->qs);
+            const __m256i qw1 = s2o_vpshufb_dequant_q4_0(wr1->qs);
+            const __m256i qw2 = s2o_vpshufb_dequant_q4_0(wr2->qs);
+            const __m256i qw3 = s2o_vpshufb_dequant_q4_0(wr3->qs);
+
+            const __m256i qa256 = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+
+            // Pair 1: columns 0 and 1 via 512-bit
+            {
+                const __m512i qw_pair = s2o_set_m256i(qw0, qw1);
+                const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+                const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
+                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm512_castps512_ps256(q), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), s2o_extract_hi_ps(q), acc1);
+            }
+
+            // Pair 2: columns 2 and 3 via 512-bit
+            {
+                const __m512i qw_pair = s2o_set_m256i(qw2, qw3);
+                const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+                const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
+                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), _mm512_castps512_ps256(q), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(d3), s2o_extract_hi_ps(q), acc3);
+            }
+        }
+
+        dst[j + 0] = s2o_hsum_float_8(acc0);
+        dst[j + 1] = s2o_hsum_float_8(acc1);
+        dst[j + 2] = s2o_hsum_float_8(acc2);
+        dst[j + 3] = s2o_hsum_float_8(acc3);
+    }
+
+    // ---- 2-wide remainder ----
+    if (j + 1 < j_end) {
+        const int64_t group = j / 4;
+        const int64_t c = j % 4;
+        const block_q4_0 * group_base = wt + group * nb_k * 4;
+
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        for (int64_t b = 0; b < nb_k; b++) {
+            const block_q4_0 * wr0 = &group_base[b * 4 + c];
+            const block_q4_0 * wr1 = &group_base[b * 4 + c + 1];
+
+            const float d0 = GGML_FP16_TO_FP32(wr0->d) * act_d[b];
+            const float d1 = GGML_FP16_TO_FP32(wr1->d) * act_d[b];
+
+            const __m256i qw0 = s2o_vpshufb_dequant_q4_0(wr0->qs);
+            const __m256i qw1 = s2o_vpshufb_dequant_q4_0(wr1->qs);
+            const __m256i qa256 = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+
+            const __m512i qw_pair = s2o_set_m256i(qw0, qw1);
+            const __m512i qa_pair = s2o_set_m256i(qa256, qa256);
+            const __m512 q = s2o_mul_sum_i8_pairs_float_512(qw_pair, qa_pair);
+
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm512_castps512_ps256(q), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), s2o_extract_hi_ps(q), acc1);
+        }
+
+        dst[j]     = s2o_hsum_float_8(acc0);
+        dst[j + 1] = s2o_hsum_float_8(acc1);
+        j += 2;
+    }
+
+    // ---- 1-wide trailing ----
+    if (j < j_end) {
+        const int64_t group = j / 4;
+        const int64_t c = j % 4;
+        const block_q4_0 * group_base = wt + group * nb_k * 4;
+
+        __m256 acc = _mm256_setzero_ps();
+        for (int64_t b = 0; b < nb_k; b++) {
+            const block_q4_0 * wr = &group_base[b * 4 + c];
+            const float combined_d = GGML_FP16_TO_FP32(wr->d) * act_d[b];
+            const __m256i qw = s2o_vpshufb_dequant_q4_0(wr->qs);
+            const __m256i qa = _mm256_loadu_si256((const __m256i *)(act_q8 + b * QK4_0));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(combined_d), s2o_mul_sum_i8_pairs_float(qw, qa), acc);
+        }
+        dst[j] = s2o_hsum_float_8(acc);
+    }
+}
+
+// ============================================================================
+// Q4_0 GEMM — AVX-512, packed layout (L2 cache-aware tiling)
+// ============================================================================
+
+static void s2o_lut_gemm_q4_0_packed_avx512(
+    float       * dst,
+    const float * src_act,
+    const void  * src_wt,
+    int64_t       M,
+    int64_t       K,
+    int64_t       j_start,
+    int64_t       j_end,
+    size_t        nb,
+    int64_t       dst_stride,
+    int64_t       act_stride
+) {
+    const int64_t bytes_per_col = (K / QK4_0) * sizeof(block_q4_0);
+    int64_t tile_n = S2O_LUT_DEFAULT_L2_TILE_BYTES / bytes_per_col;
+    if (tile_n < 4) tile_n = 4;
+    tile_n = (tile_n / 4) * 4;
+
+    const int64_t N = j_end - j_start;
+
+    if (M <= 1 || N <= tile_n) {
+        for (int64_t i = 0; i < M; i++) {
+            s2o_lut_gemv_q4_0_packed_avx512(
+                dst + i * dst_stride,
+                src_act + i * act_stride,
+                src_wt,
+                K, j_start, j_end, nb
+            );
+        }
+        return;
+    }
+
+    for (int64_t j_tile = j_start; j_tile < j_end; j_tile += tile_n) {
+        const int64_t j_tile_end = std::min(j_tile + tile_n, j_end);
+
+        for (int64_t i = 0; i < M; i++) {
+            s2o_lut_gemv_q4_0_packed_avx512(
+                dst + i * dst_stride,
+                src_act + i * act_stride,
+                src_wt,
+                K, j_tile, j_tile_end, nb
+            );
+        }
     }
 }
 
@@ -245,9 +512,11 @@ static void s2o_lut_gemm_q4_0_avx512(
 // ============================================================================
 
 const s2o_lut_kernels s2o_lut_kernels_avx512 = {
-    /* .name      = */ "avx512",
-    /* .gemv_q4_0 = */ s2o_lut_gemv_q4_0_avx512,
-    /* .gemm_q4_0 = */ s2o_lut_gemm_q4_0_avx512,
+    /* .name              = */ "avx512_4wide",
+    /* .gemv_q4_0         = */ s2o_lut_gemv_q4_0_avx512,
+    /* .gemm_q4_0         = */ s2o_lut_gemm_q4_0_avx512,
+    /* .gemv_q4_0_packed  = */ s2o_lut_gemv_q4_0_packed_avx512,
+    /* .gemm_q4_0_packed  = */ s2o_lut_gemm_q4_0_packed_avx512,
 };
 
 #endif // defined(__AVX512F__) && defined(__AVX512BW__)
