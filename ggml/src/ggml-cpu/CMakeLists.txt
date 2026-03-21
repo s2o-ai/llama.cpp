@@ -558,6 +558,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_REPACK)
     endif()
 
+    if (GGML_S2O_LUT AND GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(STATUS "S2O LUT: enabling x86 LUT-based INT4 kernels")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_S2O_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/s2o-lut/s2o-lut.cpp
+            ggml-cpu/s2o-lut/s2o-lut.h
+            ggml-cpu/s2o-lut/lut-common.h
+            ggml-cpu/s2o-lut/lut-x86-avx2.cpp
+            ggml-cpu/s2o-lut/lut-x86-avx512.cpp)
+    endif()
+
     if (GGML_CPU_KLEIDIAI)
         message(STATUS "Using KleidiAI optimized kernels if applicable")
 
